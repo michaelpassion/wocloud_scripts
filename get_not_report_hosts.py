@@ -2,16 +2,17 @@
 # author: 尹帅
 
 import os
-import re
 import pymysql
 import requests
 import toml
-
+import pymongo
 
 # 连接数据库
-def connectMysql(ip='127.0.0.1', database='nova'):
 
-    db = pymysql.connect(host=ip, user='wocloud', password='wocloud@wocloud',
+
+def connectMysql(database='nova'):
+    ip = getManagementSever()
+    db = pymysql.connect(host=ip, user='wocloud', password='wocloud@123',
                          port=3306, db=database, connect_timeout=3)
     if db != None:
         return db
@@ -36,13 +37,12 @@ def query(db, sql, fetch_all):
 
 # 从hosts文件中读取控制节点地址
 def getManagementSever():
-    with open('/etc/hosts', 'r') as hosts:
-        for line in hosts:
-            if re.match('RGCC01', line):
-                return line.split()[0]
-
+    with open('/etc/telegraf/cmdb.conf', 'r') as f:
+        return toml.load(f)['ip']
 
 # 从mysql 数据库中读取所有运行状态的虚机信息
+
+
 def getRunningHostformMysql(db):
 
     sql = 'select uuid from instances where power_state = 1'
@@ -80,7 +80,6 @@ def getInfluxdbServer():
     conf = {}
     with open('/etc/telegraf/cmdb.conf', 'r') as f:
         conf = toml.load(f)
-        ip = re.findall(r'\d+.\d+.\d+.\d+', conf['influx_url'])
         return conf['influx_url'][0]
 
 
@@ -89,8 +88,11 @@ def getRunningHostfromInflux(url):
     parameter = {'db': 'telegraf', 'q': 'SHOW TAG VALUES FROM vm_linux_system WITH KEY = "host" WHERE time >= now() -5m;SHOW TAG VALUES FROM vm_win_system WITH KEY = "host" WHERE time >= now() -5m'}
     reResult = requests.get(url, parameter).json()
 
-    values = reResult['results'][0]['series'][0]['values'] + \
-        reResult['results'][1]['series'][0]['values']
+    values = []
+    for statement in reResult['results']:
+        if statement.has_key('series'):
+            hosts = statement['series'][0]['values']
+            values += hosts
     hostsSet = set()
 
     for value in values:
@@ -98,22 +100,49 @@ def getRunningHostfromInflux(url):
 
     return hostsSet
 
+# write not report metrix hosts to mongo
+
+
+def getUnreportedHostInfo(uuids):
+    fall_to_report_hosts_info = {}
+    uuidList = list(uuids)
+    uuidStr = ','.join(map(lambda x: "'" + x + "'", uuidList))
+    sql = "select id, image_id,network_id,instance_name from instances where id in (%s) " % uuidStr
+    print sql
+    db = connectMysql('miner')
+    result = query(db, sql, True)
+    fall_to_report_hosts_info = map(lambda x: {'uuid': x[0], 'image': x[
+                                    1], 'network_id': x[2], 'instance_name': x[3]}, result)
+    return fall_to_report_hosts_info
+
+
+def writeToMongo(data):
+    host = 'localhost'
+    client = pymongo.MongoClient(host)
+    db_mongo = client['db_mongo']
+    db_mongo.authenticate("wocloud", "123456")
+    collection = db_mongo['unReporedHosts']
+
+    # clear history data
+    if collection.count() != 0:
+        collection.remove()
+
+    for values in data:
+        collection.insert(values)
 
 if __name__ == '__main__':
 
-    # rgcc = getManagementSever()
-    rgcc = raw_input("请管理节点地址，如在管理节点上运行脚本请回车: ")
-    print rgcc
-    if rgcc == '':
-        rgcc = '172.18.96.247'
-    db = connectMysql(rgcc)
+    db = connectMysql()
     mysqlHosts = getRunningHostformMysql(db)
     influxServer = getInfluxdbServer()
     influxhosts = getRunningHostfromInflux(influxServer)
-    trxHost = getTRXhosts(rgcc)
 
-    # print mysqlHosts
-    fall_to_report_hosts = mysqlHosts - influxhosts - trxHost
+    fall_to_report_hosts = mysqlHosts - influxhosts
+
+    fall_to_report_hosts_info = {}
+
+    infos = getUnreportedHostInfo(fall_to_report_hosts)
+    writeToMongo(infos)
 
     for uuid in fall_to_report_hosts:
         print '%s' % uuid
